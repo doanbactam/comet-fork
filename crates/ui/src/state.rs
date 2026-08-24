@@ -620,6 +620,11 @@ pub struct AppState {
     deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
+    /// Monotonic revision bumped on every mutation that changes what
+    /// `Transcript::sync` would render (transcript content, echoes,
+    /// subagent snapshots, chat selection clear). The UI's transcript
+    /// entity gates its `sync` on this to skip redundant reflows.
+    pub transcript_rev: u64,
     /// The selected chat's opening `WatchDocMessages` reset has landed. An
     /// empty transcript is otherwise indistinguishable from the pre-replay
     /// gap after selection, where optimistic echoes may already be visible.
@@ -685,6 +690,7 @@ impl AppState {
             selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
+            transcript_rev: 0,
             transcript_replayed: false,
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
@@ -762,6 +768,7 @@ impl AppState {
             self.transcript.clear();
             self.transcript_replayed = false;
             self.transcript_task = None;
+            self.transcript_rev = self.transcript_rev.wrapping_add(1);
         }
     }
 
@@ -924,6 +931,7 @@ impl AppState {
         self.transcript = entries;
         self.transcript_replayed = true;
         self.ack_pending_send_from_transcript();
+        self.transcript_rev = self.transcript_rev.wrapping_add(1);
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -944,6 +952,7 @@ impl AppState {
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
         self.ack_pending_send_from_transcript();
+        self.transcript_rev = self.transcript_rev.wrapping_add(1);
         Ok(())
     }
 
@@ -975,7 +984,9 @@ impl AppState {
     /// unpins the doc from the engine LRU) and the rows.
     pub fn unwatch_subagent_doc(&mut self, doc_id: &str) {
         self.sub_watch_tasks.remove(doc_id);
-        self.sub_transcripts.remove(doc_id);
+        if self.sub_transcripts.remove(doc_id).is_some() {
+            self.transcript_rev = self.transcript_rev.wrapping_add(1);
+        }
     }
 
     /// Frozen-blob path: the finished subagent's uploaded transcript, no
@@ -983,6 +994,7 @@ impl AppState {
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
         self.sub_watch_tasks.remove(&doc_id);
         self.sub_transcripts.insert(doc_id, entries);
+        self.transcript_rev = self.transcript_rev.wrapping_add(1);
     }
 
     /// Add an optimistic user echo (composer send path).
@@ -990,13 +1002,18 @@ impl AppState {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
             echoes.push(entry);
+            self.transcript_rev = self.transcript_rev.wrapping_add(1);
         }
     }
 
     /// Drop an echo (send failed — the prompt returns to the draft).
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
+            let before = echoes.len();
             echoes.retain(|e| e.id != message_id);
+            if echoes.len() != before {
+                self.transcript_rev = self.transcript_rev.wrapping_add(1);
+            }
         }
     }
 
@@ -1375,6 +1392,7 @@ impl AppState {
         self.transcript_replayed = false;
         self.echoes.clear();
         self.pending_sends.clear();
+        self.transcript_rev = self.transcript_rev.wrapping_add(1);
         self.upload_progress = None;
         self.transfers.clear();
         self.local_device_id = None;
@@ -1585,6 +1603,7 @@ impl AppState {
         self.transcript.clear();
         self.transcript_replayed = false;
         self.transcript_task = None;
+        self.transcript_rev = self.transcript_rev.wrapping_add(1);
         if let Some(id) = chat_id.as_deref() {
             // A chat implies its project (or the lack of one); `select_chat(None)`
             // (the new-session canvas) keeps the current project pick.

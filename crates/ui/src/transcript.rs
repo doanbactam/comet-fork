@@ -2296,6 +2296,10 @@ pub struct Transcript {
     /// recently (click "Show full output" after a diff → see the output).
     blob_fetch_order: HashMap<SharedString, u64>,
     blob_fetch_counter: u64,
+    /// Last `AppState::transcript_rev` processed by `sync`. When unchanged
+    /// on the next notify, and no chat attach edge is pending, `sync` exits
+    /// early — skipping the deep transcript clone and row diff.
+    synced_rev: u64,
     _observe: Subscription,
 }
 
@@ -2443,6 +2447,7 @@ impl Transcript {
             blob_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
+            synced_rev: 0,
             _observe: observe,
         };
         this.sync(cx);
@@ -3335,6 +3340,24 @@ impl Transcript {
 
     /// Rebuild rows from app state; splice minimal ranges into the list.
     fn sync(&mut self, cx: &mut Context<Self>) {
+        // Revision gate: skip the deep clone + row diff when nothing that
+        // feeds `sync` has changed since the last run. The `attached` edge
+        // (chat switch) is checked separately because it reads
+        // `selected_chat` which may change without a rev bump in edge cases
+        // (e.g. `select_chat` to the same value is a no-op).
+        {
+            let s = self.state.read(cx);
+            let selected = match &self.doc_override {
+                Some(doc_id) => Some(doc_id.clone()),
+                None => s.selected_chat.clone(),
+            };
+            let attached = selected != self.chat_id;
+            if !attached && s.transcript_rev == self.synced_rev {
+                return;
+            }
+            self.synced_rev = s.transcript_rev;
+        }
+
         let (selected, entries, echoes, replay) = {
             let s = self.state.read(cx);
             match &self.doc_override {
