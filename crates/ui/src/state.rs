@@ -619,7 +619,7 @@ pub struct AppState {
     pending_deep_link: Option<crate::links::ConversationDeepLink>,
     deep_link_notice: Option<String>,
     /// Joined transcript of the selected chat (continuations folded engine-side).
-    pub transcript: Vec<SessionMessageEntry>,
+    pub transcript: Vec<Arc<SessionMessageEntry>>,
     /// Monotonic revision bumped on every mutation that changes what
     /// `Transcript::sync` would render (transcript content, echoes,
     /// subagent snapshots, chat selection clear). The UI's transcript
@@ -631,7 +631,7 @@ pub struct AppState {
     pub transcript_replayed: bool,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
-    echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    echoes: HashMap<String, Vec<Arc<SessionMessageEntry>>>,
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
@@ -660,7 +660,7 @@ pub struct AppState {
     /// SUBAGENT transcripts keyed by subagent doc id (the right pane's
     /// subagent tabs read these). Independent of `selected_chat`: a tab's
     /// feed must survive chat switches — the tab itself is what scopes it.
-    sub_transcripts: HashMap<String, Vec<SessionMessageEntry>>,
+    sub_transcripts: HashMap<String, Vec<Arc<SessionMessageEntry>>>,
     /// One watch task per live subagent doc (single-flight per key).
     /// Dropping a task cancels the engine-side watch and unpins the doc from
     /// the engine LRU — closing a tab MUST go through
@@ -928,7 +928,7 @@ impl AppState {
         {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
-        self.transcript = entries;
+        self.transcript = entries.into_iter().map(Arc::new).collect();
         self.transcript_replayed = true;
         self.ack_pending_send_from_transcript();
         self.transcript_rev = self.transcript_rev.wrapping_add(1);
@@ -958,7 +958,7 @@ impl AppState {
 
     /// A subagent doc's current transcript copy (empty until its watch's
     /// replay frame lands, or its frozen snapshot is set).
-    pub fn sub_transcript(&self, doc_id: &str) -> &[SessionMessageEntry] {
+    pub fn sub_transcript(&self, doc_id: &str) -> &[Arc<SessionMessageEntry>] {
         self.sub_transcripts
             .get(doc_id)
             .map(|v| v.as_slice())
@@ -993,7 +993,8 @@ impl AppState {
     /// watch needed (and any in-flight watch is superseded).
     pub fn set_subagent_snapshot(&mut self, doc_id: String, entries: Vec<SessionMessageEntry>) {
         self.sub_watch_tasks.remove(&doc_id);
-        self.sub_transcripts.insert(doc_id, entries);
+        self.sub_transcripts
+            .insert(doc_id, entries.into_iter().map(Arc::new).collect());
         self.transcript_rev = self.transcript_rev.wrapping_add(1);
     }
 
@@ -1001,7 +1002,7 @@ impl AppState {
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
         if !echoes.iter().any(|e| e.id == entry.id) {
-            echoes.push(entry);
+            echoes.push(Arc::new(entry));
             self.transcript_rev = self.transcript_rev.wrapping_add(1);
         }
     }
@@ -1156,7 +1157,7 @@ impl AppState {
     }
 
     /// Unconfirmed echoes for the selected chat, in send order.
-    pub fn pending_echoes(&self) -> &[SessionMessageEntry] {
+    pub fn pending_echoes(&self) -> &[Arc<SessionMessageEntry>] {
         self.selected_chat
             .as_deref()
             .and_then(|id| self.echoes.get(id))

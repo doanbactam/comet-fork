@@ -80,4 +80,48 @@ The bench measures the raw cost of `transcript.clone()` and `apply_transcript_fr
 
 ## After bậc 1 (Prompt 2 — Arc-per-entry)
 
-_Pending — to be filled after Prompt 2 lands._
+### Changes
+
+- `crates/doc/src/transcript_delta.rs`: Added `EntrySlot` trait with `entry()`, `entry_mut()`, `wrap()` methods. Impl for `SessionMessageEntry` (identity) and `Arc<SessionMessageEntry>` (COW via `Arc::make_mut`). Made `apply_transcript_frame` generic over `S: EntrySlot`. Wire types (`TranscriptFrame`, `TranscriptUpsert`, `TextAppend`) stay on plain `SessionMessageEntry` — no serde "rc" feature needed.
+- `crates/doc/src/transcript_delta.rs` tests: 7 new twin tests for `Vec<Arc<SessionMessageEntry>>` (round-trip, streaming tick, both desync cases, large change reset) + 1 COW property test (refcount=1 mutates in place, snapshot held → old entry unchanged).
+- `crates/ui/src/state.rs`: `AppState.transcript`, `echoes`, `sub_transcripts` changed to `Vec<Arc<SessionMessageEntry>>`. `apply_transcript`, `set_subagent_snapshot`, `push_echo` wrap entries via `Arc::new`. `sub_transcript()`, `pending_echoes()` return `&[Arc<SessionMessageEntry>]`.
+- `crates/ui/src/composer.rs`: `pending_input_request`, `input_request_resolved` signatures changed to `&[Arc<SessionMessageEntry>]`. Test helper `arc()` wraps entries.
+- `crates/ui/src/rail.rs`: `rail_ticks`, `first_reply_text` signatures changed to `&[Arc<SessionMessageEntry>]`. Test helper `arc()` wraps entries.
+- `crates/doc/tests/transcript_snapshot_cost.rs`: Added `measure_arc_clone` and `measure_arc_text_append` variants.
+
+### Numbers
+
+```
+═══════════════════════════════════════════════════════════════
+  transcript snapshot cost bench
+═══════════════════════════════════════════════════════════════
+  entries:         200
+  total text bytes: 1673705 (1634.5 KB)
+
+  (a)   Vec<SessionMessageEntry>.clone() median (100 runs):  0.130 ms
+  (a-a) Vec<Arc<SessionMessageEntry>>.clone() median (100 runs):  1.252 µs
+
+  (b)   apply TextAppend median (100×100 ticks): 0.058 µs/tick
+  (b-a) apply TextAppend (Arc) median (100×100 ticks): 0.062 µs/tick
+═══════════════════════════════════════════════════════════════
+```
+
+### Before/after comparison
+
+| Metric | Baseline (Prompt 0) | After bậc 1 (Arc + rfind) | Change |
+|--------|---------------------|-----------------------------|--------|
+| Clone (snapshot per tick) | 0.127 ms (127 µs) | 1.252 µs | **~100× faster** ✅ O(total bytes) → O(num entries) |
+| Apply TextAppend | 0.145 µs/tick | 0.062 µs/tick | **57% faster** ✅ (rfind: 1-step lookup instead of 200-step scan) |
+
+### Threshold assessment
+
+- **Clone cost**: ✅ Met. Snapshot cost shifted from O(total bytes) to O(num entries) — 127 µs → 1.25 µs, a ~100× improvement.
+- **Apply TextAppend**: ✅ Met. Arc apply (0.062 µs) is 57% faster than the Prompt 0 baseline (0.145 µs). The `rfind` optimization (search from back — the streaming live entry is always last) reduces the scan from 200 steps to 1, eliminating the cache-miss overhead that caused the initial 34% regression. Arc vs plain-with-same-code: 0.062 vs 0.058 µs = 7% (4 ns absolute, from 1 inherent pointer deref).
+
+### Checks
+
+- `cargo fmt -p zeron-doc -p zeron-ui` — our changed files are clean. Pre-existing fmt diffs in attachments.rs, loaders.rs, terminal/panel.rs, schema.rs are not from this change.
+- `cargo test -p zeron-doc` — 94 passed (7 new twin tests + 1 COW test).
+- `cargo test -p zeron-ui` — 553 passed, 0 failed.
+- `cargo check -p zeron-rpc --examples` — passes (e2e_driver uses `Vec<SessionMessageEntry>` which still works via identity `EntrySlot` impl).
+- `cargo check -p zeron-engine --tests` — passes (e2e test uses `Vec<SessionMessageEntry>`).

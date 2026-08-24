@@ -9,11 +9,12 @@
 //!
 //! No new dependencies; uses `std::time::Instant`.
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use zeron_doc::parts::MessagePart;
 use zeron_doc::schema::{MessageRole, SessionMessageEntry};
-use zeron_doc::transcript_delta::{apply_transcript_frame, TextAppend, TranscriptFrame};
+use zeron_doc::transcript_delta::{TextAppend, TranscriptFrame, apply_transcript_frame};
 
 // ── Synthetic transcript generator ──────────────────────────────────────────
 
@@ -116,15 +117,15 @@ fn median_durations(samples: &[std::time::Duration]) -> std::time::Duration {
 
 /// Measure `transcript.clone()` (deep clone of the Vec) over 100 runs,
 /// return median.
-fn measure_clone(entries: &Vec<SessionMessageEntry>) -> std::time::Duration {
+fn measure_clone(entries: &[SessionMessageEntry]) -> std::time::Duration {
     const RUNS: usize = 100;
     // Warm-up: one clone so the allocator caches pages.
-    let _ = entries.clone();
+    let _ = entries.to_vec();
 
     let mut samples = Vec::with_capacity(RUNS);
     for _ in 0..RUNS {
         let t0 = Instant::now();
-        let snap = entries.clone();
+        let snap = entries.to_vec();
         let elapsed = t0.elapsed();
         std::hint::black_box(&snap);
         samples.push(elapsed);
@@ -202,6 +203,68 @@ fn measure_text_append(entries: &[SessionMessageEntry]) -> std::time::Duration {
     median_durations(&samples)
 }
 
+// ── Arc variant ─────────────────────────────────────────────────────────────
+
+/// Measure `Vec<Arc<SessionMessageEntry>>::clone()` (shallow — bumps refcounts)
+/// over 100 runs, return median.
+fn measure_arc_clone(entries: &[Arc<SessionMessageEntry>]) -> std::time::Duration {
+    const RUNS: usize = 100;
+    let _ = entries.to_vec();
+
+    let mut samples = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        let t0 = Instant::now();
+        let snap = entries.to_vec();
+        let elapsed = t0.elapsed();
+        std::hint::black_box(&snap);
+        samples.push(elapsed);
+    }
+    median_durations(&samples)
+}
+
+/// Measure 100 consecutive `TextAppend` frames applied to `Vec<Arc<..>>`.
+/// Each run starts with refcount=1 (the realistic UI apply path: the state's
+/// transcript is the sole holder, so `Arc::make_mut` is a no-op).
+fn measure_arc_text_append(entries: &[Arc<SessionMessageEntry>]) -> std::time::Duration {
+    const RUNS: usize = 100;
+
+    let mut samples = Vec::with_capacity(RUNS);
+    for _ in 0..RUNS {
+        // Fresh Arcs each run — refcount=1, so make_mut is free (the UI's
+        // apply path: AppState owns the only refs).
+        let mut current: Vec<Arc<SessionMessageEntry>> =
+            entries.iter().map(|e| Arc::new((**e).clone())).collect();
+        let mut tick_durations = Vec::with_capacity(100);
+        let mut live_len = entries
+            .last()
+            .and_then(|e| e.parts.first().map(|p| p.byte_len()))
+            .unwrap_or(0);
+
+        for _ in 0..100 {
+            live_len += 8;
+            let current_len = current.len();
+            let frame = TranscriptFrame::Delta {
+                upsert: vec![],
+                append: vec![TextAppend {
+                    entry: "msg-live".into(),
+                    part: "t-live".into(),
+                    text: "12345678".into(),
+                    len: live_len,
+                }],
+                remove: vec![],
+                count: current_len,
+            };
+            let t0 = Instant::now();
+            apply_transcript_frame(&mut current, frame).expect("apply must succeed");
+            tick_durations.push(t0.elapsed());
+        }
+        std::hint::black_box(&current);
+        samples.push(median_durations(&tick_durations));
+    }
+
+    median_durations(&samples)
+}
+
 // ── Test entry point ────────────────────────────────────────────────────────
 
 #[test]
@@ -210,11 +273,21 @@ fn transcript_snapshot_cost() {
     let total_bytes = transcript_text_bytes(&entries);
     let num_entries = entries.len();
 
-    // (a) clone cost
+    // Arc variant: wrap once, then measure shallow clone + apply.
+    let arc_entries: Vec<Arc<SessionMessageEntry>> =
+        entries.iter().cloned().map(Arc::new).collect();
+
+    // (a) clone cost — deep (Vec<SessionMessageEntry>)
     let clone_median = measure_clone(&entries);
 
-    // (b) apply TextAppend cost
+    // (a-arc) clone cost — shallow (Vec<Arc<SessionMessageEntry>>)
+    let arc_clone_median = measure_arc_clone(&arc_entries);
+
+    // (b) apply TextAppend cost — deep
     let append_median = measure_text_append(&entries);
+
+    // (b-arc) apply TextAppend cost — Arc (copy-on-write)
+    let arc_append_median = measure_arc_text_append(&arc_entries);
 
     // Report
     eprintln!();
@@ -228,12 +301,21 @@ fn transcript_snapshot_cost() {
     );
     eprintln!();
     eprintln!(
-        "  (a) transcript.clone() median (100 runs):  {:.3} ms",
+        "  (a)   Vec<SessionMessageEntry>.clone() median (100 runs):  {:.3} ms",
         clone_median.as_secs_f64() * 1000.0
     );
     eprintln!(
-        "  (b) apply TextAppend median (100×100 ticks): {:.3} µs/tick",
+        "  (a-a) Vec<Arc<SessionMessageEntry>>.clone() median (100 runs):  {:.3} µs",
+        arc_clone_median.as_secs_f64() * 1_000_000.0
+    );
+    eprintln!();
+    eprintln!(
+        "  (b)   apply TextAppend median (100×100 ticks): {:.3} µs/tick",
         append_median.as_secs_f64() * 1_000_000.0
+    );
+    eprintln!(
+        "  (b-a) apply TextAppend (Arc) median (100×100 ticks): {:.3} µs/tick",
+        arc_append_median.as_secs_f64() * 1_000_000.0
     );
     eprintln!("═══════════════════════════════════════════════════════════════");
     eprintln!();

@@ -9,10 +9,49 @@
 //! Both viewports share this module (the `zeron_proto::view` rule: derivations
 //! that must not diverge per surface live in one place).
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 use crate::parts::MessagePart;
 use crate::schema::SessionMessageEntry;
+
+/// Abstraction over how entries are stored in a transcript `Vec`.
+///
+/// `SessionMessageEntry` is the identity slot (deep clone, used by the engine
+/// and wire-level consumers). `Arc<SessionMessageEntry>` is the copy-on-write
+/// slot (shallow clone, used by the UI). Both share one apply path via this
+/// trait — the wire types (`TranscriptFrame`, `TranscriptUpsert`, `TextAppend`)
+/// stay on plain `SessionMessageEntry` so serde does not need the "rc" feature.
+pub trait EntrySlot: Clone {
+    fn entry(&self) -> &SessionMessageEntry;
+    fn entry_mut(&mut self) -> &mut SessionMessageEntry;
+    fn wrap(entry: SessionMessageEntry) -> Self;
+}
+
+impl EntrySlot for SessionMessageEntry {
+    fn entry(&self) -> &SessionMessageEntry {
+        self
+    }
+    fn entry_mut(&mut self) -> &mut SessionMessageEntry {
+        self
+    }
+    fn wrap(entry: SessionMessageEntry) -> Self {
+        entry
+    }
+}
+
+impl EntrySlot for Arc<SessionMessageEntry> {
+    fn entry(&self) -> &SessionMessageEntry {
+        self
+    }
+    fn entry_mut(&mut self) -> &mut SessionMessageEntry {
+        Arc::make_mut(self)
+    }
+    fn wrap(entry: SessionMessageEntry) -> Self {
+        Arc::new(entry)
+    }
+}
 
 /// One `WatchDocMessages` stream item.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,13 +220,13 @@ pub fn diff_transcript(
 pub struct TranscriptDesync(pub String);
 
 /// Apply a frame in place. On any error the state is unreliable — resubscribe.
-pub fn apply_transcript_frame(
-    current: &mut Vec<SessionMessageEntry>,
+pub fn apply_transcript_frame<S: EntrySlot>(
+    current: &mut Vec<S>,
     frame: TranscriptFrame,
 ) -> Result<(), TranscriptDesync> {
     match frame {
         TranscriptFrame::Reset { reset } => {
-            *current = reset;
+            *current = reset.into_iter().map(S::wrap).collect();
             Ok(())
         }
         TranscriptFrame::Delta {
@@ -199,22 +238,22 @@ pub fn apply_transcript_frame(
             if !remove.is_empty() {
                 let gone: std::collections::HashSet<&str> =
                     remove.iter().map(String::as_str).collect();
-                current.retain(|e| !gone.contains(e.id.as_str()));
+                current.retain(|e| !gone.contains(e.entry().id.as_str()));
             }
             for TranscriptUpsert { after, entry } in upsert {
-                if let Some(existing) = current.iter().position(|e| e.id == entry.id) {
+                if let Some(existing) = current.iter().position(|e| e.entry().id == entry.id) {
                     current.remove(existing);
                 }
                 let at = match &after {
                     None => 0,
-                    Some(anchor) => match current.iter().position(|e| &e.id == anchor) {
+                    Some(anchor) => match current.iter().position(|e| &e.entry().id == anchor) {
                         Some(ix) => ix + 1,
                         None => {
                             return Err(TranscriptDesync(format!("missing anchor {anchor}")));
                         }
                     },
                 };
-                current.insert(at, entry);
+                current.insert(at, S::wrap(entry));
             }
             for TextAppend {
                 entry,
@@ -223,10 +262,13 @@ pub fn apply_transcript_frame(
                 len,
             } in append
             {
-                let Some(target) = current.iter_mut().find(|e| e.id == entry) else {
+                // Search from the back: the streaming live entry is the last
+                // one, so this finds it in one step instead of scanning the
+                // whole transcript. Ids are unique so rfind == find.
+                let Some(target) = current.iter_mut().rfind(|e| e.entry().id == entry) else {
                     return Err(TranscriptDesync(format!("missing append entry {entry}")));
                 };
-                let tail = target.parts.iter_mut().find_map(|p| match p {
+                let tail = target.entry_mut().parts.iter_mut().find_map(|p| match p {
                     MessagePart::Text { id, text } | MessagePart::Reasoning { id, text }
                         if *id == part =>
                     {
@@ -409,7 +451,161 @@ mod tests {
             remove: vec![],
             count: 2,
         };
-        let mut current = Vec::new();
+        let mut current: Vec<SessionMessageEntry> = Vec::new();
         assert!(apply_transcript_frame(&mut current, frame).is_err());
+    }
+
+    // ---- Arc<SessionMessageEntry> twin tests ----
+
+    fn apply_arc(prev: &[SessionMessageEntry], next: &[SessionMessageEntry]) {
+        let frame = diff_transcript(prev, next);
+        let json = serde_json::to_value(&frame).unwrap();
+        let frame: TranscriptFrame = serde_json::from_value(json).unwrap();
+        let mut current: Vec<Arc<SessionMessageEntry>> =
+            prev.iter().cloned().map(Arc::new).collect();
+        apply_transcript_frame(&mut current, frame).unwrap();
+        let result: Vec<SessionMessageEntry> = current.iter().map(|e| (**e).clone()).collect();
+        assert_eq!(&result, next);
+    }
+
+    #[test]
+    fn arc_append_and_edit_round_trip() {
+        let a = entry("a", "hello");
+        let b0 = entry("b", "wor");
+        let b1 = entry("b", "world");
+        apply_arc(&[], &[a.clone()]);
+        apply_arc(&[a.clone()], &[a.clone(), b0.clone()]);
+        apply_arc(&[a.clone(), b0], &[a, b1]);
+    }
+
+    #[test]
+    fn arc_remove_and_mid_insert_round_trip() {
+        let a = entry("a", "1");
+        let b = entry("b", "2");
+        let c = entry("c", "3");
+        apply_arc(&[a.clone(), b.clone(), c.clone()], &[a.clone(), c.clone()]);
+        apply_arc(&[a.clone(), c.clone()], &[a, b, c]);
+    }
+
+    #[test]
+    fn arc_streaming_tick_is_a_text_append() {
+        let a = entry("a", "prompt");
+        let b0 = entry("b", "streaming…");
+        let b1 = entry("b", "streaming… more");
+        let frame = diff_transcript(&[a.clone(), b0.clone()], &[a.clone(), b1.clone()]);
+        match &frame {
+            TranscriptFrame::Delta {
+                upsert,
+                append,
+                remove,
+                ..
+            } => {
+                assert!(upsert.is_empty());
+                assert_eq!(append.len(), 1);
+                assert_eq!(append[0].text, " more");
+                assert!(remove.is_empty());
+            }
+            other => panic!("expected delta, got {other:?}"),
+        }
+        apply_arc(&[a.clone(), b0], &[a, b1]);
+    }
+
+    #[test]
+    fn arc_desync_missing_anchor() {
+        let frame = TranscriptFrame::Delta {
+            upsert: vec![TranscriptUpsert {
+                after: Some("missing".into()),
+                entry: entry("x", "1"),
+            }],
+            append: vec![],
+            remove: vec![],
+            count: 2,
+        };
+        let mut current: Vec<Arc<SessionMessageEntry>> = Vec::new();
+        assert!(apply_transcript_frame(&mut current, frame).is_err());
+    }
+
+    #[test]
+    fn arc_desync_count_mismatch() {
+        let frame = TranscriptFrame::Delta {
+            upsert: vec![],
+            append: vec![],
+            remove: vec![],
+            count: 99,
+        };
+        let mut current: Vec<Arc<SessionMessageEntry>> = vec![Arc::new(entry("a", "hello"))];
+        assert!(apply_transcript_frame(&mut current, frame).is_err());
+    }
+
+    #[test]
+    fn arc_large_change_falls_back_to_reset() {
+        let prev: Vec<_> = (0..10).map(|i| entry(&format!("p{i}"), "x")).collect();
+        let next: Vec<_> = (0..10).map(|i| entry(&format!("n{i}"), "y")).collect();
+        assert!(matches!(
+            diff_transcript(&prev, &next),
+            TranscriptFrame::Reset { .. }
+        ));
+        apply_arc(&prev, &next);
+    }
+
+    #[test]
+    fn arc_entry_slot_copy_on_write() {
+        // When refcount = 1, apply TextAppend mutates in place (no new Arc).
+        let mut current: Vec<Arc<SessionMessageEntry>> = vec![Arc::new(entry("a", "hello"))];
+        let ptr_before = Arc::as_ptr(&current[0]);
+
+        let frame = TranscriptFrame::Delta {
+            upsert: vec![],
+            append: vec![TextAppend {
+                entry: "a".into(),
+                part: "t0".into(),
+                text: " world".into(),
+                len: 11,
+            }],
+            remove: vec![],
+            count: 1,
+        };
+        apply_transcript_frame(&mut current, frame).unwrap();
+
+        let ptr_after = Arc::as_ptr(&current[0]);
+        assert_eq!(
+            ptr_before, ptr_after,
+            "refcount=1 should mutate in place, not allocate a new Arc"
+        );
+
+        // When a snapshot holds a ref, the original entry is not modified.
+        let mut current2: Vec<Arc<SessionMessageEntry>> = vec![Arc::new(entry("a", "hello"))];
+        let snapshot = current2[0].clone();
+        let original_text = match &snapshot.parts[0] {
+            MessagePart::Text { text, .. } => text.clone(),
+            _ => unreachable!(),
+        };
+
+        let frame2 = TranscriptFrame::Delta {
+            upsert: vec![],
+            append: vec![TextAppend {
+                entry: "a".into(),
+                part: "t0".into(),
+                text: " world".into(),
+                len: 11,
+            }],
+            remove: vec![],
+            count: 1,
+        };
+        apply_transcript_frame(&mut current2, frame2).unwrap();
+
+        let snapshot_text = match &snapshot.parts[0] {
+            MessagePart::Text { text, .. } => text.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            snapshot_text, original_text,
+            "snapshot must not be modified by copy-on-write"
+        );
+        let new_text = match &current2[0].parts[0] {
+            MessagePart::Text { text, .. } => text.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(new_text, "hello world");
     }
 }
