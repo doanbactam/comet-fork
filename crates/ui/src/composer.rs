@@ -4670,10 +4670,12 @@ impl Composer {
                     // assistant entry took over). Never on run death: the
                     // question stays answerable until answered — the engine
                     // delivers a dead run's answer as a resumed turn.
-                    let transcript = self.state.read(cx).transcript.clone();
-                    let released = input_request_resolved(&transcript, &wizard.request_id)
-                        || (!transcript.is_empty()
-                            && !self.answered_requests.contains(&wizard.request_id));
+                    let released = {
+                        let s = self.state.read(cx);
+                        input_request_resolved(&s.transcript, &wizard.request_id)
+                            || (!s.transcript.is_empty()
+                                && !self.answered_requests.contains(&wizard.request_id))
+                    };
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
@@ -5465,9 +5467,11 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
+                let still_pending = {
+                    let s = composer.state.read(cx);
+                    pending_input_request(&s.transcript)
+                        .is_some_and(|(pending_id, _)| pending_id == request_id)
+                };
                 if still_pending && composer.answered_requests.remove(&request_id) {
                     cx.notify();
                 }
