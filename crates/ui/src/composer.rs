@@ -24,6 +24,8 @@ use gpui::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 
+use std::sync::Arc;
+
 use zeron_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use zeron_proto::{
     FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
@@ -455,7 +457,7 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
 /// matches the original composer.tsx, which reads the live-assistant fold —
 /// rebuilt from replay even after the run died).
 pub fn pending_input_request(
-    transcript: &[SessionMessageEntry],
+    transcript: &[Arc<SessionMessageEntry>],
 ) -> Option<(String, Vec<UserInputQuestion>)> {
     transcript
         .iter()
@@ -476,7 +478,7 @@ pub fn pending_input_request(
 
 /// Whether the transcript shows `request_id` explicitly resolved (here or on
 /// another device) — the wizard latch's release condition.
-pub fn input_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
+pub fn input_request_resolved(transcript: &[Arc<SessionMessageEntry>], request_id: &str) -> bool {
     transcript.iter().any(|entry| {
         entry.parts.iter().any(|part| {
             matches!(
@@ -4670,10 +4672,12 @@ impl Composer {
                     // assistant entry took over). Never on run death: the
                     // question stays answerable until answered — the engine
                     // delivers a dead run's answer as a resumed turn.
-                    let transcript = self.state.read(cx).transcript.clone();
-                    let released = input_request_resolved(&transcript, &wizard.request_id)
-                        || (!transcript.is_empty()
-                            && !self.answered_requests.contains(&wizard.request_id));
+                    let released = {
+                        let s = self.state.read(cx);
+                        input_request_resolved(&s.transcript, &wizard.request_id)
+                            || (!s.transcript.is_empty()
+                                && !self.answered_requests.contains(&wizard.request_id))
+                    };
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
@@ -5465,9 +5469,11 @@ impl Composer {
             // un-hide the panel instead of leaving the question unanswerable.
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
-                let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
+                let still_pending = {
+                    let s = composer.state.read(cx);
+                    pending_input_request(&s.transcript)
+                        .is_some_and(|(pending_id, _)| pending_id == request_id)
+                };
                 if still_pending && composer.answered_requests.remove(&request_id) {
                     cx.notify();
                 }
@@ -7063,6 +7069,9 @@ mod tests {
     #[test]
     fn pending_input_detection() {
         use zeron_doc::MessageStatus;
+        fn arc(entries: Vec<SessionMessageEntry>) -> Vec<Arc<SessionMessageEntry>> {
+            entries.into_iter().map(Arc::new).collect()
+        }
         let input_part = MessagePart::Input {
             id: "in-r1".into(),
             request_id: "r1".into(),
@@ -7079,10 +7088,10 @@ mod tests {
             continuation_of: None,
         };
         // Streaming entry with unresolved input → panel.
-        let t = vec![entry(
+        let t = arc(vec![entry(
             Some(MessageStatus::Streaming),
             vec![input_part.clone()],
-        )];
+        )]);
         assert_eq!(
             pending_input_request(&t).map(|(id, _)| id),
             Some("r1".into())
@@ -7091,16 +7100,16 @@ mod tests {
         // question stays answerable until answered (the engine delivers the
         // answer as a resumed turn), so a run reaped under its question —
         // engine restart — must not orphan it (user report).
-        let t = vec![entry(
+        let t = arc(vec![entry(
             Some(MessageStatus::Aborted),
             vec![input_part.clone()],
-        )];
+        )]);
         assert_eq!(
             pending_input_request(&t).map(|(id, _)| id),
             Some("r1".into())
         );
         // A NEWER assistant entry supersedes an unanswered question.
-        let t = vec![
+        let t = arc(vec![
             entry(Some(MessageStatus::Aborted), vec![input_part.clone()]),
             SessionMessageEntry {
                 id: "m2".into(),
@@ -7114,7 +7123,7 @@ mod tests {
                 status: Some(MessageStatus::Complete),
                 continuation_of: None,
             },
-        ];
+        ]);
         assert!(pending_input_request(&t).is_none());
         // Resolved part → no panel.
         let resolved = MessagePart::Input {
@@ -7123,10 +7132,10 @@ mod tests {
             questions: vec![],
             resolved: true,
         };
-        let t = vec![entry(
+        let t = arc(vec![entry(
             Some(MessageStatus::Streaming),
             vec![resolved.clone()],
-        )];
+        )]);
         assert!(pending_input_request(&t).is_none());
         assert!(pending_input_request(&[]).is_none());
 
@@ -7146,10 +7155,10 @@ mod tests {
             status: Some(MessageStatus::Complete),
             continuation_of: None,
         };
-        let t = vec![
+        let t = arc(vec![
             entry(Some(MessageStatus::Streaming), vec![input_part.clone()]),
             user_echo,
-        ];
+        ]);
         assert_eq!(
             pending_input_request(&t).map(|(id, _)| id),
             Some("r1".into()),
@@ -7158,7 +7167,7 @@ mod tests {
 
         // Latch release: only an explicitly resolved matching part releases.
         assert!(!input_request_resolved(&t, "r1"));
-        let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
+        let t = arc(vec![entry(Some(MessageStatus::Streaming), vec![resolved])]);
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
     }

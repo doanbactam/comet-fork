@@ -8,6 +8,7 @@
 //! extension since the rail shares the transcript's rows and `ListState`.
 
 use gpui::{AnyElement, Context, ListOffset, SharedString, div, prelude::*, px};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use zeron_doc::{MessagePart, MessageRole, SessionMessageEntry};
@@ -53,7 +54,7 @@ fn user_text(entry: &SessionMessageEntry) -> String {
     crate::attachments::user_message_rail_text(&raw)
 }
 
-fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
+fn first_reply_text(entries: &[Arc<SessionMessageEntry>]) -> Option<String> {
     entries
         .iter()
         .find(|e| e.role == MessageRole::Assistant)
@@ -72,8 +73,8 @@ fn first_reply_text(entries: &[SessionMessageEntry]) -> Option<String> {
 /// carries the opening of the assistant reply that followed it, for the hover
 /// preview card.
 pub fn rail_ticks(
-    entries: &[SessionMessageEntry],
-    echoes: &[SessionMessageEntry],
+    entries: &[Arc<SessionMessageEntry>],
+    echoes: &[Arc<SessionMessageEntry>],
 ) -> Vec<RailTick> {
     let mut ticks: Vec<RailTick> = Vec::new();
     for (ix, entry) in entries.iter().enumerate() {
@@ -412,11 +413,10 @@ impl Transcript {
         if !self.rail_enabled() {
             return gpui::Empty.into_any_element();
         }
-        let (entries, echoes) = {
+        let ticks = {
             let state = self.state_entity().read(cx);
-            (state.transcript.clone(), state.pending_echoes().to_vec())
+            rail_ticks(&state.transcript, state.pending_echoes())
         };
-        let ticks = rail_ticks(&entries, &echoes);
         // Map each tick to its transcript row (user rows share the entry id).
         let pairs: Vec<(RailTick, usize)> = ticks
             .into_iter()
@@ -649,12 +649,15 @@ mod tests {
 
     #[test]
     fn ticks_map_user_prompts_with_reply_openings() {
-        let entries = vec![
+        fn arc(entries: Vec<SessionMessageEntry>) -> Vec<Arc<SessionMessageEntry>> {
+            entries.into_iter().map(Arc::new).collect()
+        }
+        let entries = arc(vec![
             entry("u1", MessageRole::User, "first question"),
             entry("a1", MessageRole::Assistant, "first answer"),
             entry("u2", MessageRole::User, "second question"),
             entry("a2", MessageRole::Assistant, "second answer"),
-        ];
+        ]);
         let ticks = rail_ticks(&entries, &[]);
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[0].message_id, "u1");
@@ -665,11 +668,14 @@ mod tests {
 
     #[test]
     fn ticks_include_echoes_deduped() {
-        let entries = vec![entry("u1", MessageRole::User, "sent")];
-        let echoes = vec![
+        fn arc(entries: Vec<SessionMessageEntry>) -> Vec<Arc<SessionMessageEntry>> {
+            entries.into_iter().map(Arc::new).collect()
+        }
+        let entries = arc(vec![entry("u1", MessageRole::User, "sent")]);
+        let echoes = arc(vec![
             entry("u1", MessageRole::User, "sent"), // confirmed already → deduped
             entry("u2", MessageRole::User, "pending"),
-        ];
+        ]);
         let ticks = rail_ticks(&entries, &echoes);
         assert_eq!(ticks.len(), 2);
         assert_eq!(ticks[1].message_id, "u2");
@@ -678,11 +684,14 @@ mod tests {
 
     #[test]
     fn tick_without_reply_yet() {
-        let entries = vec![
+        fn arc(entries: Vec<SessionMessageEntry>) -> Vec<Arc<SessionMessageEntry>> {
+            entries.into_iter().map(Arc::new).collect()
+        }
+        let entries = arc(vec![
             entry("u1", MessageRole::User, "q"),
             entry("a1", MessageRole::Assistant, "reply to first"),
             entry("u2", MessageRole::User, "latest"),
-        ];
+        ]);
         let ticks = rail_ticks(&entries, &[]);
         // The last prompt has no assistant entry after it.
         assert_eq!(ticks[1].reply, None);
