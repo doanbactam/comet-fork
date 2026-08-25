@@ -1690,6 +1690,7 @@ impl Shell {
                     self.splash = next;
                     if next == SplashPhase::Gone {
                         crate::boot_stats::mark_splash_gone();
+                        cx.notify();
                     } else {
                         self.splash_task = Some(cx.spawn(async move |this, cx| {
                             cx.background_executor().timer(hold).await;
@@ -1707,6 +1708,7 @@ impl Shell {
             ConnectionStatus::Failed(_) => {
                 self.splash = SplashPhase::Gone;
                 crate::boot_stats::mark_splash_gone();
+                cx.notify();
             }
             ConnectionStatus::Connecting => {}
         }

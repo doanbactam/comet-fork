@@ -520,16 +520,13 @@ impl ChatDocHandle {
         match self.doc.read_entries() {
             Ok(entries) if entries.is_empty() => {
                 // L4: keep a provisional host-published tail until catch-up
-                // writes real entries. Stay dirty so the next non-empty
-                // publish still rebuilds from the doc.
-                if self.provisional_tail.load(Ordering::Acquire)
-                    && !self.messages_tx.borrow().is_empty()
-                {
+                // writes real entries (including while the paint is still
+                // in flight — flag may be set before messages land).
+                if self.provisional_tail.load(Ordering::Acquire) {
                     self.mirror_dirty.store(true, Ordering::Release);
                     return;
                 }
                 self.mirror_dirty.store(false, Ordering::Release);
-                self.provisional_tail.store(false, Ordering::Release);
                 self.messages_tx.send_replace(Vec::new());
             }
             Ok(entries) => {
@@ -563,10 +560,12 @@ impl ChatDocHandle {
         if self.messages_tx.borrow().len() >= messages.len() {
             return;
         }
-        self.provisional_tail.store(true, Ordering::Release);
         // Stay dirty: catch-up must still trigger a full publish from the doc.
         self.mirror_dirty.store(true, Ordering::Release);
+        // Mirror first, then arm the flag — a concurrent empty publish that
+        // sees the flag must not observe an empty mirror and clear it.
         self.messages_tx.send_replace(messages);
+        self.provisional_tail.store(true, Ordering::Release);
         tracing::debug!(
             chat = %self.chat_id,
             "tail-first paint applied (provisional until catch-up)"
@@ -579,7 +578,10 @@ impl ChatDocHandle {
     fn publish_messages_if_watched(&self) {
         if self.messages_tx.receiver_count() == 0 {
             self.mirror_dirty.store(true, Ordering::Release);
-            // Shrink the stale mirror: watch_messages rebuilds on attach.
+            // Warm-opens are unwatched; do not wipe an L4 provisional tail.
+            if self.provisional_tail.load(Ordering::Acquire) {
+                return;
+            }
             self.messages_tx.send_replace(Vec::new());
         } else {
             self.publish_messages();
@@ -747,9 +749,9 @@ impl DocHost {
     }
 
     /// Boot warm-open (ARCHITECTURE §5 / PARITY §3.3): open recent chats so
-    /// the first sidebar click and inbound nudges hit a warm handle. Cap and
-    /// window live in [`zeron_proto::view`]; the doc LRU may keep fewer than
-    /// the open attempts (newest stay — we open oldest-first).
+    /// the first sidebar click and inbound nudges hit a warm handle. Selection
+    /// window is 14d; open count is capped at [`WARM_DOC_CAP`] so we never
+    /// storm past the LRU (fresh opens are pinned for `EVICT_MIN_IDLE_MS`).
     fn spawn_boot_warm_open(&self) {
         let host = self.clone();
         self.spawn_worker(async move {
@@ -762,7 +764,7 @@ impl DocHost {
                     chats,
                     now_ms(),
                     zeron_proto::view::BOOT_WARM_OPEN_WINDOW_MS,
-                    zeron_proto::view::BOOT_WARM_OPEN_CAP,
+                    WARM_DOC_CAP.min(zeron_proto::view::BOOT_WARM_OPEN_CAP),
                 );
                 let mut opened = 0usize;
                 for id in &ids {
@@ -995,7 +997,24 @@ impl DocHost {
                     handles.remove(chat_id);
                 } else {
                     handle.touch();
-                    return Ok(handle.clone());
+                    // Re-arm L4 when a warm/cached handle is still empty mid
+                    // catch-up (warm-open often paints then sits unwatched;
+                    // WatchDocMessages must not miss the sidecar).
+                    let needs_tail = handle.room_gen >= 2
+                        && handle.messages_tx.borrow().is_empty()
+                        && !handle.provisional_tail.load(Ordering::Acquire)
+                        && handle
+                            .doc
+                            .read_entries()
+                            .map(|e| e.is_empty())
+                            .unwrap_or(true)
+                        && lock(&handle.chat2).is_none();
+                    let warm = handle.clone();
+                    drop(handles);
+                    if needs_tail && let Some(edge) = &self.inner.config.edge {
+                        self.spawn_tail_first_paint(edge.clone(), &warm);
+                    }
+                    return Ok(warm);
                 }
             }
         }
@@ -1292,6 +1311,14 @@ impl DocHost {
                     return;
                 }
             };
+            if !tail.chat_id.is_empty() && tail.chat_id != chat {
+                tracing::debug!(
+                    chat = %chat,
+                    sidecar = %tail.chat_id,
+                    "tail-first: chat id mismatch"
+                );
+                return;
+            }
             let Some(handle) = weak.upgrade() else {
                 return;
             };
