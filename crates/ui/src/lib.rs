@@ -16,6 +16,7 @@ pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
 pub mod badges;
+pub mod boot_stats;
 pub mod change_requests;
 pub mod changes;
 pub mod comments;
@@ -131,6 +132,7 @@ impl gpui::Global for ReopenState {}
 /// connect-or-embed), 1320×880 window (min 900×600) with [`shell::Shell`] as the
 /// root view, boot splash overlaid until the engine reports ready.
 pub fn run_app(config: UiConfig) {
+    boot_stats::mark_process_start();
     let app = gpui_platform::application().with_assets(icons::Assets);
     let (url_tx, mut url_rx) = futures::channel::mpsc::unbounded::<String>();
     let callback_tx = url_tx.clone();
@@ -286,6 +288,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
         },
     )
     .expect("failed to open window");
+    boot_stats::mark_window_open();
     // Belt and braces: assert the blur once the window actually exists. The
     // `WindowOptions` value is applied during creation, before the view is
     // attached; re-pushing it here means a window is never left opaque.

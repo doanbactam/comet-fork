@@ -14,7 +14,9 @@ use gpui::{
     canvas, div, point, px,
 };
 
-use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, ZERON_PULSE};
+use crate::motion::{
+    self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, SPLASH_OUT_QUICK, ZERON_PULSE,
+};
 use crate::theme::{GlyphPalette, Theme};
 
 // Shared with the terminal viewport (`zeron_proto::motion`) so both animate the
@@ -277,9 +279,16 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
 /// Full-window boot splash: the app's dot loader (the same [`gradient_spinner`]
 /// the session list and the reconnecting line pulse — user request, replacing
 /// the hero ascii) over the app background with a quiet status line. While
-/// `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px lift); the
-/// shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App) -> AnyElement {
+/// `fading` it plays splash-out; `quick` selects the short L2 path (150ms, no
+/// hold) instead of the full 650ms catalog exit. The shell removes the overlay
+/// once the matching motion has run its course.
+pub fn splash_overlay(
+    theme: &Theme,
+    fading: bool,
+    quick: bool,
+    view: EntityId,
+    cx: &mut App,
+) -> AnyElement {
     let content = div()
         .absolute()
         .inset_0()
@@ -295,7 +304,13 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
         .gap(px(12.0))
         // Cell 2.5 — the size every other surface runs this spinner at (the
         // "Sending…" strip, the transcript working trailer).
-        .child(gradient_spinner("boot-splash-spinner", theme, 2.5, view, cx))
+        .child(gradient_spinner(
+            "boot-splash-spinner",
+            theme,
+            2.5,
+            view,
+            cx,
+        ))
         .child(
             div()
                 .text_size(px(12.0))
@@ -303,7 +318,11 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
                 .child(SharedString::from("Setting up Zeron environment")),
         );
     if fading {
-        motion::splash_out("boot-splash-out", content).into_any_element()
+        if quick {
+            motion::splash_out_quick("boot-splash-out", content).into_any_element()
+        } else {
+            motion::splash_out("boot-splash-out", content).into_any_element()
+        }
     } else {
         content.into_any_element()
     }
@@ -312,6 +331,7 @@ pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App)
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);
+    assert!(SPLASH_OUT_QUICK.delay_ms == 0);
     assert!(ZERON_PULSE.duration_ms == 2400);
     assert!(GRADIENT_SPIN.duration_ms == 750);
 };

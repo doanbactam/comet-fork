@@ -930,6 +930,7 @@ impl AppState {
         }
         self.transcript = entries.into_iter().map(Arc::new).collect();
         self.transcript_replayed = true;
+        crate::boot_stats::mark_first_transcript_frame();
         self.ack_pending_send_from_transcript();
         self.transcript_rev = self.transcript_rev.wrapping_add(1);
     }
@@ -944,6 +945,7 @@ impl AppState {
         zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if is_reset {
             self.transcript_replayed = true;
+            crate::boot_stats::mark_first_transcript_frame();
         }
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)

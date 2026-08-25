@@ -31,7 +31,9 @@ use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
+use crate::motion::{
+    self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, SPLASH_OUT_QUICK, TAB_SLIDE,
+};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -690,7 +692,10 @@ impl WidthTween {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SplashPhase {
     Visible,
+    /// Full catalog splash-out (650ms).
     FadingOut,
+    /// Fast-path splash-out when Ready arrived quickly (L2).
+    FadingOutQuick,
     Gone,
 }
 
@@ -1169,6 +1174,8 @@ pub struct Shell {
     motion_active: std::cell::Cell<bool>,
     splash: SplashPhase,
     splash_task: Option<Task<()>>,
+    /// Process/window clock origin for adaptive splash (L2) and boot_stats.
+    boot_started: std::time::Instant,
     save_task: Option<Task<()>>,
     /// Focus fallback (registered on first paint — [`Shell::new`] has no
     /// window): keyboard shortcuts dispatch through the window focus chain, so
@@ -1382,6 +1389,7 @@ impl Shell {
             motion_active: std::cell::Cell::new(false),
             splash: SplashPhase::Visible,
             splash_task: None,
+            boot_started: std::time::Instant::now(),
             save_task: None,
             focus_sub: None,
             activation_sub: None,
@@ -1659,22 +1667,47 @@ impl Shell {
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
+                crate::boot_stats::mark_engine_ready();
                 if self.splash == SplashPhase::Visible {
-                    self.splash = SplashPhase::FadingOut;
-                    self.splash_task = Some(cx.spawn(async move |this, cx| {
-                        cx.background_executor()
-                            .timer(SPLASH_OUT.total() + Duration::from_millis(30))
-                            .await;
-                        this.update(cx, |shell, cx| {
-                            shell.splash = SplashPhase::Gone;
-                            cx.notify();
-                        })
-                        .ok();
-                    }));
+                    let ready_after = crate::boot_stats::elapsed_since_start()
+                        .unwrap_or_else(|| self.boot_started.elapsed());
+                    // L2: skip or shorten splash when the engine is already Ready.
+                    // Reduced motion always skips the fade veil.
+                    let reduced = motion::reduced_motion(cx);
+                    let (next, hold) = if reduced || ready_after <= motion::SPLASH_SKIP_READY {
+                        (SplashPhase::Gone, Duration::ZERO)
+                    } else if ready_after <= motion::SPLASH_QUICK_READY {
+                        (
+                            SplashPhase::FadingOutQuick,
+                            SPLASH_OUT_QUICK.total() + Duration::from_millis(30),
+                        )
+                    } else {
+                        (
+                            SplashPhase::FadingOut,
+                            SPLASH_OUT.total() + Duration::from_millis(30),
+                        )
+                    };
+                    self.splash = next;
+                    if next == SplashPhase::Gone {
+                        crate::boot_stats::mark_splash_gone();
+                    } else {
+                        self.splash_task = Some(cx.spawn(async move |this, cx| {
+                            cx.background_executor().timer(hold).await;
+                            this.update(cx, |shell, cx| {
+                                shell.splash = SplashPhase::Gone;
+                                crate::boot_stats::mark_splash_gone();
+                                cx.notify();
+                            })
+                            .ok();
+                        }));
+                    }
                 }
             }
             // Reveal the gate card immediately; the splash never returns mid-session.
-            ConnectionStatus::Failed(_) => self.splash = SplashPhase::Gone,
+            ConnectionStatus::Failed(_) => {
+                self.splash = SplashPhase::Gone;
+                crate::boot_stats::mark_splash_gone();
+            }
             ConnectionStatus::Connecting => {}
         }
     }
@@ -7700,11 +7733,33 @@ impl Render for Shell {
         let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, false, cx.entity_id(), cx))
+                root.child(loaders::splash_overlay(
+                    &theme,
+                    false,
+                    false,
+                    cx.entity_id(),
+                    cx,
+                ))
             }
             SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                root.child(loaders::splash_overlay(&theme, true, cx.entity_id(), cx))
+                root.child(loaders::splash_overlay(
+                    &theme,
+                    true,
+                    false,
+                    cx.entity_id(),
+                    cx,
+                ))
+            }
+            SplashPhase::FadingOutQuick => {
+                let theme = Theme::of(cx).clone();
+                root.child(loaders::splash_overlay(
+                    &theme,
+                    true,
+                    true,
+                    cx.entity_id(),
+                    cx,
+                ))
             }
             SplashPhase::Gone => root,
         };
