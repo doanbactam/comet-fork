@@ -313,7 +313,7 @@ pub fn splash_overlay(
         ))
         .child(
             div()
-                .text_size(px(12.0))
+                .text_size(crate::typography::ui_rems(12.0))
                 .text_color(theme.text_muted.opacity(0.7))
                 .child(SharedString::from("Setting up Zeron environment")),
         );
