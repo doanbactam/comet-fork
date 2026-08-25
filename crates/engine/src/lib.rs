@@ -270,11 +270,17 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
-        sessions.set_titles(TitleGenerator::new(
-            workspace.clone(),
-            registry.clone(),
-            repos.clone(),
-        ));
+        // ZERON_TITLES=0 skips the auto-titling generator entirely — mem-smoke
+        // and other benches need a quiet engine: an outbound LLM call per
+        // completed turn lands inside retention samples and varies run to run
+        // (retry backoff spans tens of seconds; reqwest+rustls init costs MBs).
+        if std::env::var("ZERON_TITLES").as_deref() != Ok("0") {
+            sessions.set_titles(TitleGenerator::new(
+                workspace.clone(),
+                registry.clone(),
+                repos.clone(),
+            ));
+        }
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
         // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
         let turn_diff = diff_sync.clone();

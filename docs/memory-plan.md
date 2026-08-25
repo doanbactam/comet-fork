@@ -139,6 +139,15 @@ recent chats (PARITY gap) is unchanged.
 
 - Viewer laptop after browsing 20 chats incl. images: **<250MB** (from ~600).
 - RSS flat ±10% over 8h mixed use (no monotonic ratchet).
-- mem-smoke thresholds in CI: engine idle <40MB; stream-retention <3× raw
-  text; reopen p95 <100ms; idle creep <1MB/10min.
+- mem-smoke thresholds in CI (`.github/workflows/ci.yml`, `scripts/mem-smoke.sh`):
+  engine idle <40MB; reopen p95 <100ms; idle creep <1MB/10min (nightly run);
+  stream growth gated by an absolute MB budget calibrated on healthy main
+  (`ZERON_MEM_SMOKE_MAX_GROWTH_MB`). The §5 "<3× raw text" ratio remains the
+  north star and is printed every run, but it cannot gate at CI workload
+  sizes: one-time infra (~10MB) and by-design warm-doc pins (`WARM_DOC_CAP`)
+  don't scale with text bytes, and mimalloc's bursty page-return makes point
+  RSS samples swing ±20MB — the driver samples floors, not points. Measured
+  healthy-main warm-doc cost is ~9–27MB per 1MB streamed chat (many-small-
+  append shape); closing that to ~1× text is phase-3 shallow-snapshot work,
+  at which point the ratio gate can return.
 - No feel-budget regression (§2), verified per landing PR.

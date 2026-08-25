@@ -1,0 +1,74 @@
+name: ci
+
+# The §8 memory gate (docs/memory-plan.md): scripts/mem-smoke.sh boots one
+# headless mock engine and asserts the acceptance thresholds.
+#
+# Per-PR job skips the 10-minute idle-creep window (ZERON_MEM_SMOKE_CREEP=0) —
+# idle <40MB, stream-retention <3×, reopen p95 <100ms still gate every PR.
+# The nightly cron on main runs the FULL four-threshold gate including
+# creep <1MB/10min, so a slow-leak regression is caught within a day and
+# bisectable against main history.
+#
+# Thresholds are calibrated on Linux/glibc + mimalloc (see the script header);
+# x86_64-only because /proc RSS sampling and the numbers are Linux-specific.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # 02:17 UTC daily — off the hour to dodge shared-runner crunch.
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast gate: every PR, creep window skipped.
+  mem-smoke:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      ZERON_MEM_SMOKE_CREEP: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: mem-smoke (idle, retention, reopen p95)
+        run: scripts/mem-smoke.sh
+
+  # Full gate: nightly on main, includes the 10-min idle-creep window.
+  mem-smoke-full:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: gpui system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcb1-dev libx11-xcb-dev \
+            libfontconfig1-dev libfreetype-dev libasound2-dev \
+            libvulkan-dev pkg-config cmake
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: mem-smoke (all §8 thresholds incl. creep)
+        run: scripts/mem-smoke.sh

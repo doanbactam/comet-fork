@@ -1351,7 +1351,13 @@ async fn drive_run(
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
     // a session nobody comes back to (zeron SESSION_IDLE_MS).
-    const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+    // ZERON_SESSION_IDLE_SECS shortens the park for smokes/demos — a parked
+    // run holds its doc Arc, so the LRU can never evict until it's reaped.
+    let session_idle =
+        std::env::var("ZERON_SESSION_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(std::time::Duration::from_secs(30 * 60), std::time::Duration::from_secs);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
     // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
@@ -1441,7 +1447,7 @@ async fn drive_run(
             // nobody returned to in 30 minutes releases its child. The turn
             // was finalized at Done, so this end is clean — no aborted stamp.
             _ = tokio::time::sleep_until(
-                idle_since.map(|at| at + SESSION_IDLE).unwrap_or_else(tokio::time::Instant::now)
+                idle_since.map(|at| at + session_idle).unwrap_or_else(tokio::time::Instant::now)
             ), if idle_since.is_some() => {
                 tracing::info!(chat = %chat_id, "reaping idle persistent session");
                 if let Some(token) = lock(&inner.runs)
