@@ -1,0 +1,5 @@
+{
+  "name": "zeron",
+  "user": "ubuntu",
+  "install": "sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libx11-dev libxcb1-dev libx11-xcb-dev libfontconfig1-dev libfreetype-dev libasound2-dev libvulkan-dev pkg-config cmake && cargo build -p zeron && cargo build -p zeron-rpc --example e2e_driver --example rpc_probe && cargo build --release -p zeron && cargo build --release -p zeron-rpc --example mem_driver && (cd edge && npm ci)"
+}
