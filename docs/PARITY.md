@@ -10,7 +10,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | 1.1 Window shell | partial | gpui window, always-dark theme, external links via OS browser. Deferred: frameless-inset/traffic-light chrome (macOS packaging not executed), single-instance lock, dev-vs-packaged port split (env vars instead). |
-| 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash with fade-out cap (`ui/src/shell.rs`). |
+| 1.2 App phases | done | Gate / OrgGate ("Create your workspace" + memberships) / app with crossfade; boot splash with adaptive fade-out (skip ≤400ms Ready, quick 150ms ≤1.2s, else full splash-out; reduced-motion skips). Headed cold-start milestones logged via `boot_stats` (`ZERON_BOOT_STATS=0` to silence). |
 | 1.3 Shell layout | done | Collapsible drag-resizable sidebar (208–400), right Changes pane (360–760, 52% cap), header variants, widths persisted to `ui-settings.json`. |
 | 1.4 Keyboard shortcuts | done | Customizable keymap, click-to-record with conflict detection, per-row reset, rows grouped into Panels / Sessions / Jump cards (`ui/src/settings/shortcuts.rs`); persisted with UI settings. Session stepping is Ctrl+Tab / Ctrl+Shift+Tab over the sidebar list (rebindable) rather than the original's Shift+Up/Down. Thread jumps are Mod+1–9 over the same list with hold-modifier key-cap hints (t3code `THREAD_JUMP_KEYBINDING_COMMANDS`), and Mod+Shift+A archives the open session. |
 | 1.5 Routes | partial | Native navigation instead of URL routes; devices / agents / shortcuts / archived settings pages exist. Profile page (heatmap) is an §8 exclusion. |
@@ -45,7 +45,7 @@ not built yet).
 | --- | --- | --- |
 | 3.1 Lifecycle | partial | Device registration, presence heartbeat (ephemeral, 15s), stale-session recovery, host-only doc executor with steer→new-turn fallback, single-instance data-dir lock. CLI auth decoupled from the daemon: `zeron login`/`logout`/`status` work on the persisted session and exit; headless TTY sign-in remains, and off-TTY (systemd/launchd) headless fails fast with "run `zeron login` first"; `zeron daemon install/start/stop/restart/status/uninstall` manages launchd / systemd `--user` units (install-time PATH captured into the unit for harness CLIs). Gaps: login-shell PATH capture for the headed app, crash shield, parent-PID watchdog. |
 | 3.2 Sessions engine | partial | Run journal on disk with crash recovery (aborted stamps), steering mailbox at step boundaries, doc hooks at boundaries, streamed part folding at STREAM_COMMIT_MS. Gaps: idle reaper + 10-min stall watchdog for persistent harness sessions. |
-| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Gap (minor): no boot-time warm-open of recent chats (14d/30) — cold chats rely on nudges. |
+| 3.3 Session-docs host | done | docs.sqlite snapshots + processed-command ledger, mark-BEFORE-execute, room join per open chat, diff sidecar publish, cold-chat delivery both directions (nudge POST on queue for remote-hosted chats + warm-open on nudge receipt). Boot warm-open of recent chats (14d / cap 30); chat2 cold open paints host `/tail` sidecar before catch-up (L4). |
 | 3.4 Terminals | done | PTYs, 1MB bounded replay + `afterSeq` resume, 32 max, exited 30-min TTL, live shells survive detach. |
 | 3.5 Repos/diffs | done | list/add/clone/create, branches, worktrees, checkout identity; CheckoutDiffSync (fs watchers + repair pass, name-status+numstat+patch incl. untracked, 3MiB cap, sha256, sidecar publish); chat.branch upkeep from HEAD watch; folder listing with timeout. |
 | 3.7 Auth / uploads / accounts / device-room | done | WorkOS code+loopback and paste-code flows, refresh persistence (0600), org gate, dev mode; chunked uploads; claude/codex credential swap with usage probes and OAuth flows; host relay (virtual sockets over `{s,k,to,from}` frames) + peer link cache. |
@@ -101,7 +101,7 @@ not built yet).
   contents not designed.
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
 - **Engine hardening**: single-instance lock, parent-PID watchdog, crash
-  shield, idle reaper / stall watchdog, boot warm-open of recent chats.
+  shield, idle reaper / stall watchdog.
 
 ## Summary
 

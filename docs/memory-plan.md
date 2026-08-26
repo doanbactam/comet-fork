@@ -107,9 +107,9 @@ viewer-laptop steady state ≈ gpui baseline + selected chat ≈ 150–250MB, fl
 - **Shallow snapshots** (deferred, correctness-sensitive): client-side trim to
   the edge's compaction frontier would cut in-memory doc 2.5–4× → ~1×; needs
   the stale-peer story (`room.rs:132` gives up rather than rebuilding).
-- **Tail-first cold open** (`materialize_tail` exists unwired,
-  `schema.rs:738`): paint last-64 for never-opened remote chats while the doc
-  backfills. Perceived-latency win, not a memory item.
+- **Tail-first cold open** (wired): empty chat2 local docs GET the host
+  `/chat2/{id}/tail` sidecar and paint it provisionally while catch-up
+  fills the doc (`doc_host::spawn_tail_first_paint`).
 
 ## 7. Implementation status (2026-08-03)
 
@@ -132,8 +132,9 @@ which the baseline never did. Cold-open stayed on the measured ~62ms path.
 Known follow-ups: GPU atlas tiles for raw-bytes images still free only on
 window close (needs a small gpui-fork patch exposing a drop path for
 `ImageSource::Image`); UI-side full-transcript clone per frame
-(`transcript.rs` sync) could move to Arc-per-entry; boot-time warm-open of
-recent chats (PARITY gap) is unchanged.
+(`transcript.rs` sync) could move to Arc-per-entry. Boot-time warm-open of
+recent chats (14d / cap 30) and headed boot_stats / adaptive splash are
+shipped alongside the memory work.
 
 ## 8. Acceptance
 

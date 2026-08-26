@@ -292,6 +292,12 @@ pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Boot splash exit: 0.5s fade + 6px lift after a 0.15s hold.
 pub const SPLASH_OUT: MotionSpec = MotionSpec::new(500, EASE).with_delay(150);
+/// Fast-path splash exit when the engine is Ready quickly (L2): no hold, 150ms fade.
+pub const SPLASH_OUT_QUICK: MotionSpec = MotionSpec::new(150, EASE);
+/// Ready within this duration → skip splash fade entirely (L2).
+pub const SPLASH_SKIP_READY: std::time::Duration = std::time::Duration::from_millis(400);
+/// Ready within this duration (but slower than skip) → use [`SPLASH_OUT_QUICK`].
+pub const SPLASH_QUICK_READY: std::time::Duration = std::time::Duration::from_millis(1_200);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
 pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
 /// Terminal tab drag-reorder sliding transforms: 150ms (§1.10).
@@ -383,6 +389,16 @@ where
     E: Styled + IntoElement + 'static,
 {
     element.with_animation(id, SPLASH_OUT.animation(), |el, t| {
+        el.opacity(1.0 - t).top(px(-6.0 * t))
+    })
+}
+
+/// Short splash exit for fast boots (L2): 150ms fade + lift, no hold.
+pub fn splash_out_quick<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
+where
+    E: Styled + IntoElement + 'static,
+{
+    element.with_animation(id, SPLASH_OUT_QUICK.animation(), |el, t| {
         el.opacity(1.0 - t).top(px(-6.0 * t))
     })
 }
@@ -731,6 +747,8 @@ mod tests {
     fn spec_delay_holds_then_runs() {
         // SPLASH_OUT: 150ms delay + 500ms run = 650ms total.
         assert_eq!(SPLASH_OUT.total(), Duration::from_millis(650));
+        assert_eq!(SPLASH_OUT_QUICK.total(), Duration::from_millis(150));
+        assert_eq!(SPLASH_OUT_QUICK.delay_ms, 0);
         assert_eq!(SPLASH_OUT.progress(0.0), 0.0);
         // Still inside the delay window at raw 0.2 (130ms < 150ms).
         assert_eq!(SPLASH_OUT.progress(0.2), 0.0);

@@ -136,6 +136,39 @@ pub fn sort_chats(chats: &mut [Chat]) {
 }
 
 // ---------------------------------------------------------------------------
+// Boot warm-open (session-docs host: recent chats within 14d, cap 30)
+// ---------------------------------------------------------------------------
+
+/// Default recency window for boot warm-open: 14 days in milliseconds.
+pub const BOOT_WARM_OPEN_WINDOW_MS: i64 = 14 * 24 * 60 * 60 * 1000;
+/// Cap on chats opened at boot for warm residency (LRU may keep fewer).
+pub const BOOT_WARM_OPEN_CAP: usize = 30;
+
+/// Chat ids to warm-open at engine boot, oldest-first within the most-recent
+/// [`BOOT_WARM_OPEN_CAP`] so successive `open()` touches leave the newest in
+/// the doc LRU. Skips archived rows and anything outside `window_ms`.
+pub fn warm_open_chat_ids(chats: &[Chat], now_ms: i64, window_ms: i64, cap: usize) -> Vec<String> {
+    if cap == 0 {
+        return Vec::new();
+    }
+    let mut rows: Vec<&Chat> = chats
+        .iter()
+        .filter(|c| !c.archived)
+        .filter(|c| {
+            let t = c.last_message_at.unwrap_or(c.created_at).timestamp_millis();
+            now_ms.saturating_sub(t) <= window_ms
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ka = a.last_message_at.unwrap_or(a.created_at);
+        let kb = b.last_message_at.unwrap_or(b.created_at);
+        ka.cmp(&kb).then_with(|| a.id.cmp(&b.id))
+    });
+    let skip = rows.len().saturating_sub(cap);
+    rows[skip..].iter().map(|c| c.id.clone()).collect()
+}
+
+// ---------------------------------------------------------------------------
 // Boot gate
 // ---------------------------------------------------------------------------
 
@@ -241,6 +274,64 @@ mod gate_tests {
         assert_eq!(
             gate_phase(&ConnectionStatus::Ready, None, None),
             GatePhase::SignIn
+        );
+    }
+}
+
+#[cfg(test)]
+mod warm_open_tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn chat(id: &str, archived: bool, last_msg_ms: Option<i64>, created_ms: i64) -> Chat {
+        Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            source_context: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: last_msg_ms.map(|ms| Utc.timestamp_millis_opt(ms).unwrap()),
+            created_at: Utc.timestamp_millis_opt(created_ms).unwrap(),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn warm_open_picks_recent_oldest_first_and_caps() {
+        let now = 1_000_000_i64;
+        let chats = vec![
+            chat("old", false, Some(now - BOOT_WARM_OPEN_WINDOW_MS - 1), now),
+            chat("a", false, Some(now - 3), now - 10),
+            chat("b", false, Some(now - 2), now - 10),
+            chat("c", false, Some(now - 1), now - 10),
+            chat("archived", true, Some(now - 1), now - 10),
+        ];
+        assert_eq!(
+            warm_open_chat_ids(&chats, now, BOOT_WARM_OPEN_WINDOW_MS, 2),
+            vec!["b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            warm_open_chat_ids(&chats, now, BOOT_WARM_OPEN_WINDOW_MS, 30),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+    }
+
+    #[test]
+    fn warm_open_falls_back_to_created_at() {
+        let now = 5_000_i64;
+        let chats = vec![chat("fresh", false, None, now - 10)];
+        assert_eq!(
+            warm_open_chat_ids(&chats, now, BOOT_WARM_OPEN_WINDOW_MS, 30),
+            vec!["fresh".to_string()]
         );
     }
 }

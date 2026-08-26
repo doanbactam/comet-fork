@@ -48,6 +48,9 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// ~11ms of a warm doc, so the cap trades no perceptible open latency.
 const WARM_DOC_CAP: usize = 12;
 
+/// How long the second boot warm-open pass waits for a registry sync frame.
+const BOOT_WARM_OPEN_SYNC_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Resident-memory estimate per compressed snapshot byte. Loro snapshots are
 /// columnar+compressed; the in-memory doc plus mirror runs well above the blob
 /// size. A rough multiplier is enough here — the budget is a safety ceiling,
@@ -376,6 +379,9 @@ pub struct ChatDocHandle {
     /// True when the doc changed while nobody watched: the mirror rebuild is
     /// deferred to the next `watch_messages` attach instead of paid per commit.
     mirror_dirty: AtomicBool,
+    /// A host-published tail sidecar painted this handle before catch-up
+    /// filled the local doc (L4). Empty `publish_messages` must not wipe it.
+    provisional_tail: AtomicBool,
     /// Epoch ms of the last open/watch touch — the LRU eviction key.
     last_access: AtomicI64,
     /// Last known snapshot blob size — the eviction budget estimate's input.
@@ -511,9 +517,21 @@ impl ChatDocHandle {
     }
 
     fn publish_messages(&self) {
-        self.mirror_dirty.store(false, Ordering::Release);
         match self.doc.read_entries() {
+            Ok(entries) if entries.is_empty() => {
+                // L4: keep a provisional host-published tail until catch-up
+                // writes real entries (including while the paint is still
+                // in flight — flag may be set before messages land).
+                if self.provisional_tail.load(Ordering::Acquire) {
+                    self.mirror_dirty.store(true, Ordering::Release);
+                    return;
+                }
+                self.mirror_dirty.store(false, Ordering::Release);
+                self.messages_tx.send_replace(Vec::new());
+            }
             Ok(entries) => {
+                self.mirror_dirty.store(false, Ordering::Release);
+                self.provisional_tail.store(false, Ordering::Release);
                 let joined = join_continuation_entries(entries);
                 // send_replace: update the watch even with no subscribers yet, so a
                 // late subscriber's first borrow sees the current transcript.
@@ -525,13 +543,45 @@ impl ChatDocHandle {
         }
     }
 
+    /// Paint a host-published SessionTail before chat2 catch-up finishes (L4).
+    /// No-op when the local doc already has entries or a richer mirror is up.
+    fn publish_provisional_tail(&self, messages: Vec<SessionMessageEntry>) {
+        if messages.is_empty() {
+            return;
+        }
+        if self
+            .doc
+            .read_entries()
+            .map(|e| !e.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if self.messages_tx.borrow().len() >= messages.len() {
+            return;
+        }
+        // Stay dirty: catch-up must still trigger a full publish from the doc.
+        self.mirror_dirty.store(true, Ordering::Release);
+        // Mirror first, then arm the flag — a concurrent empty publish that
+        // sees the flag must not observe an empty mirror and clear it.
+        self.messages_tx.send_replace(messages);
+        self.provisional_tail.store(true, Ordering::Release);
+        tracing::debug!(
+            chat = %self.chat_id,
+            "tail-first paint applied (provisional until catch-up)"
+        );
+    }
+
     /// Per-commit publish path: unwatched docs just mark the mirror dirty —
     /// rebuilding a full transcript nobody reads was a per-tick cost on every
     /// open doc (and kept a second transcript copy hot).
     fn publish_messages_if_watched(&self) {
         if self.messages_tx.receiver_count() == 0 {
             self.mirror_dirty.store(true, Ordering::Release);
-            // Shrink the stale mirror: watch_messages rebuilds on attach.
+            // Warm-opens are unwatched; do not wipe an L4 provisional tail.
+            if self.provisional_tail.load(Ordering::Acquire) {
+                return;
+            }
             self.messages_tx.send_replace(Vec::new());
         } else {
             self.publish_messages();
@@ -694,7 +744,60 @@ impl DocHost {
         if self.inner.workspace.set(workspace).is_ok() {
             self.spawn_cutover_watcher(chats);
             self.spawn_migration_sweep();
+            self.spawn_boot_warm_open();
         }
+    }
+
+    /// Boot warm-open (ARCHITECTURE §5 / PARITY §3.3): open recent chats so
+    /// the first sidebar click and inbound nudges hit a warm handle. Selection
+    /// window is 14d; open count is capped at [`WARM_DOC_CAP`] so we never
+    /// storm past the LRU (fresh opens are pinned for `EVICT_MIN_IDLE_MS`).
+    fn spawn_boot_warm_open(&self) {
+        let host = self.clone();
+        self.spawn_worker(async move {
+            let Some(ws) = host.workspace() else {
+                return;
+            };
+            let mut chats_rx = ws.watch_chats();
+            let open_pass = |chats: &[zeron_proto::Chat]| {
+                let ids = zeron_proto::view::warm_open_chat_ids(
+                    chats,
+                    now_ms(),
+                    zeron_proto::view::BOOT_WARM_OPEN_WINDOW_MS,
+                    WARM_DOC_CAP.min(zeron_proto::view::BOOT_WARM_OPEN_CAP),
+                );
+                let mut opened = 0usize;
+                for id in &ids {
+                    if lock(&host.inner.handles).contains_key(id) {
+                        continue;
+                    }
+                    match host.open(id) {
+                        Ok(_) => opened += 1,
+                        Err(err) => {
+                            tracing::debug!(chat = %id, error = %err, "boot warm-open skipped");
+                        }
+                    }
+                }
+                if opened > 0 || !ids.is_empty() {
+                    tracing::info!(
+                        candidates = ids.len(),
+                        opened,
+                        "boot warm-open of recent chats"
+                    );
+                }
+            };
+            // Immediate pass: local registry snapshot is already loaded.
+            open_pass(&chats_rx.borrow());
+            // One more pass after a registry sync frame (or the wait cap).
+            tokio::select! {
+                changed = chats_rx.changed() => {
+                    if changed.is_ok() {
+                        open_pass(&chats_rx.borrow());
+                    }
+                }
+                _ = tokio::time::sleep(BOOT_WARM_OPEN_SYNC_WAIT) => {}
+            }
+        });
     }
 
     /// Host migration sweep: proactively seed this device's own s2 chats
@@ -894,7 +997,24 @@ impl DocHost {
                     handles.remove(chat_id);
                 } else {
                     handle.touch();
-                    return Ok(handle.clone());
+                    // Re-arm L4 when a warm/cached handle is still empty mid
+                    // catch-up (warm-open often paints then sits unwatched;
+                    // WatchDocMessages must not miss the sidecar).
+                    let needs_tail = handle.room_gen >= 2
+                        && handle.messages_tx.borrow().is_empty()
+                        && !handle.provisional_tail.load(Ordering::Acquire)
+                        && handle
+                            .doc
+                            .read_entries()
+                            .map(|e| e.is_empty())
+                            .unwrap_or(true)
+                        && lock(&handle.chat2).is_none();
+                    let warm = handle.clone();
+                    drop(handles);
+                    if needs_tail && let Some(edge) = &self.inner.config.edge {
+                        self.spawn_tail_first_paint(edge.clone(), &warm);
+                    }
+                    return Ok(warm);
                 }
             }
         }
@@ -1027,6 +1147,7 @@ impl DocHost {
             doc: doc.clone(),
             messages_tx,
             mirror_dirty: AtomicBool::new(true),
+            provisional_tail: AtomicBool::new(false),
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room_gen,
@@ -1116,6 +1237,17 @@ impl DocHost {
                     }
                 }
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
+                // L4: while catch-up downloads the checkpoint, paint the
+                // host-published tail sidecar so a never-opened remote chat
+                // first-paints in one HTTP RTT.
+                let local_empty = handle
+                    .doc
+                    .read_entries()
+                    .map(|e| e.is_empty())
+                    .unwrap_or(true);
+                if local_empty {
+                    self.spawn_tail_first_paint(edge.clone(), &handle);
+                }
             } else {
                 // Straggler gen-1 chat (the s2 client is gone — post-cutover,
                 // no device reads or writes an s2 room). The local fat doc
@@ -1135,6 +1267,63 @@ impl DocHost {
         self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
+    }
+
+    /// L4 tail-first paint: GET the host-published `/chat2/{id}/tail` sidecar
+    /// and push it into the messages watch while chat2 catch-up is still
+    /// downloading the full checkpoint. Replaced by a real
+    /// [`ChatDocHandle::publish_messages`] once the local doc has entries.
+    fn spawn_tail_first_paint(&self, edge: EdgeConfig, handle: &Arc<ChatDocHandle>) {
+        let chat = handle.chat_id.clone();
+        let weak = Arc::downgrade(handle);
+        let http = self.inner.http.clone();
+        self.spawn_worker(async move {
+            let Some(bearer) = edge.bearer().await else {
+                return;
+            };
+            let url = format!("{}/chat2/{}/tail", edge.url.trim_end_matches('/'), chat);
+            let response = match http.get(&url).bearer_auth(&bearer).send().await {
+                Ok(res) if res.status().is_success() => res,
+                Ok(res) => {
+                    tracing::debug!(
+                        chat = %chat,
+                        status = res.status().as_u16(),
+                        "tail-first: no sidecar"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    tracing::debug!(chat = %chat, error = %err, "tail-first: fetch failed");
+                    return;
+                }
+            };
+            let body = match response.bytes().await {
+                Ok(b) => b,
+                Err(err) => {
+                    tracing::debug!(chat = %chat, error = %err, "tail-first: body failed");
+                    return;
+                }
+            };
+            let tail: zeron_doc::SessionTail = match serde_json::from_slice(&body) {
+                Ok(t) => t,
+                Err(err) => {
+                    tracing::debug!(chat = %chat, error = %err, "tail-first: bad json");
+                    return;
+                }
+            };
+            if !tail.chat_id.is_empty() && tail.chat_id != chat {
+                tracing::debug!(
+                    chat = %chat,
+                    sidecar = %tail.chat_id,
+                    "tail-first: chat id mismatch"
+                );
+                return;
+            }
+            let Some(handle) = weak.upgrade() else {
+                return;
+            };
+            handle.publish_provisional_tail(tail.messages);
+        });
     }
 
     /// chat2 relay join (docs/chat2-sync.md C3): deadline on every dial,
